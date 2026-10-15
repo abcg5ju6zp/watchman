@@ -26,6 +26,11 @@ Watchman:
   Download:
     RefreshInterval: "12h"
     InitialDataDirectory: ""
+    # Directory used to stage isolated refresh generations and recover an
+    # interrupted publish on startup. Empty defaults to
+    # "<InitialDataDirectory>/.watchman-refresh" (or an OS temp directory).
+    # Override with REFRESH_STATE_DIRECTORY.
+    RefreshStateDirectory: ""
 
     # Specify which lists to download and include in Watchman results
     # Examples: us_csl, us_ofac, us_non_sdn, us_fincen_311, uk_csl, eu_csl, un_csl

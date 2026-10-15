@@ -87,7 +87,7 @@ func (dl *Downloader) withAdditionalHeaders(additional map[string]string) {
 }
 
 const (
-	HashKey = "hash:sha256"
+	HashKey             = "hash:sha256"
 )
 
 type Files map[string]io.ReadCloser
@@ -169,6 +169,17 @@ findfiles:
 				return
 			}
 
+			// Persist the fetched bytes into dir so the directory is a
+			// self-contained, pinned snapshot of the refresh generation.
+			// Persistence is best effort: a read-only or full filesystem
+			// falls back to the in-memory reader instead of failing refresh.
+			content = dl.persistDownload(dir, filename, content, logger)
+			if content == nil {
+				// The body was consumed but could not be made available; omit
+				// the file the same way a failed download does.
+				return
+			}
+
 			logger.Info().Logf("successful download after %v", dur)
 
 			mu.Lock()
@@ -179,6 +190,71 @@ findfiles:
 	wg.Wait()
 
 	return out, nil
+}
+
+// persistDownload spools fetched content into dir under a temp file, then
+// atomically renames it to filename and returns a reader for the persisted
+// file. When dir is empty, persistence is disabled and the original reader is
+// returned unchanged.
+//
+// Any persistence error (read-only directory, out of space, unsafe filename)
+// is logged and the original in-memory reader is returned so callers keep the
+// historical behavior.
+func (dl *Downloader) persistDownload(dir, filename string, content io.ReadCloser, logger log.Logger) io.ReadCloser {
+	if dir == "" || content == nil {
+		return content
+	}
+	// Never accept path components in the logical filename; each download maps
+	// to exactly one regular file inside dir.
+	safeName := filepath.Base(filepath.Clean(filename))
+	if safeName == "." || safeName == string(filepath.Separator) || safeName != filename {
+		return content
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		dl.Logger.Info().Logf("not persisting %s: %v", filename, err)
+		return content
+	}
+
+	tmp, err := os.CreateTemp(dir, ".download-*")
+	if err != nil {
+		dl.Logger.Info().Logf("not persisting %s: %v", filename, err)
+		return content
+	}
+	tmpName := tmp.Name()
+
+	if _, err := io.Copy(tmp, content); err != nil {
+		content.Close()
+		tmp.Close()
+		os.Remove(tmpName)
+		logger.Warn().Logf("not persisting %s: %v", filename, err)
+		// The body has been consumed, so the in-memory fallback cannot serve
+		// it either; omit the file just like a failed download would.
+		return nil
+	}
+	content.Close()
+	if err := tmp.Sync(); err != nil {
+		logger.Warn().Logf("flushing %s: %v", filename, err)
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		logger.Warn().Logf("not persisting %s: %v", filename, err)
+		return nil
+	}
+
+	finalName := filepath.Join(dir, safeName)
+	if err := os.Rename(tmpName, finalName); err != nil {
+		os.Remove(tmpName)
+		logger.Warn().Logf("not persisting %s: %v", filename, err)
+		return nil
+	}
+
+	fd, err := os.Open(finalName)
+	if err != nil {
+		logger.Warn().Logf("reopening persisted %s: %v", filename, err)
+		return nil
+	}
+	return fd
 }
 
 func (dl *Downloader) createDownloadLogger(filename, downloadURL string) log.Logger {

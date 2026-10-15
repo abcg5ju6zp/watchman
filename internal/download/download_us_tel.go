@@ -26,7 +26,7 @@ func loadUSTelRecords(ctx context.Context, logger log.Logger, conf Config, respo
 
 	start := time.Now()
 
-	files, err := us_tel.DownloadUsTel(ctx, logger, initialDataDirectory(conf))
+	files, err := us_tel.DownloadUsTel(ctx, logger, effectiveDataDirectory(conf))
 	if err != nil {
 		return fmt.Errorf("US TEL download error: %w", err)
 	}
@@ -71,7 +71,7 @@ func loadUSTelRecords(ctx context.Context, logger log.Logger, conf Config, respo
 	logger.Debug().Logf("finished US TEL preparation: %d entities in %v", len(entities), time.Since(start))
 	span.AddEvent("finished US TEL preparation")
 
-	if len(entities) == 0 && errorOnEmptyList(conf) {
+	if len(entities) == 0 && conf.ErrorOnEmptyList {
 		return errors.New("no entities parsed from US TEL")
 	}
 

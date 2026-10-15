@@ -36,6 +36,15 @@ type Service interface {
 	// ids and names must have the same length.
 	BuildIndex(ctx context.Context, names []string, ids []string) error
 
+	// BuildIndexCandidate encodes entity names into a fresh vector index
+	// without replacing the index currently serving searches. A refresh builds
+	// the candidate first and only calls PublishIndexCandidate once every
+	// enabled capability is ready, so online requests never mix generations.
+	BuildIndexCandidate(ctx context.Context, names []string, ids []string) (IndexCandidate, error)
+
+	// PublishIndexCandidate atomically swaps the searchable vector index.
+	PublishIndexCandidate(candidate IndexCandidate)
+
 	// Search finds similar names using vector similarity.
 	// Returns up to k results sorted by similarity score (highest first).
 	Search(ctx context.Context, query string, k int) ([]SearchResult, error)
@@ -194,8 +203,29 @@ func (s *service) EncodeBatch(ctx context.Context, texts []string) ([][]float64,
 	return result, nil
 }
 
-// BuildIndex creates a searchable index from entity names.
+// IndexCandidate is a fully built vector index that is not yet serving
+// searches. Refresh builds one from the candidate generation and publishes it
+// together with the text corpus so the two indexes always belong to the same
+// generation.
+type IndexCandidate struct {
+	idx *vectorIndex
+}
+
+// BuildIndex creates a searchable index from entity names and publishes it
+// immediately. The coordinated refresh path uses BuildIndexCandidate followed
+// by PublishIndexCandidate.
 func (s *service) BuildIndex(ctx context.Context, names []string, ids []string) error {
+	candidate, err := s.BuildIndexCandidate(ctx, names, ids)
+	if err != nil {
+		return err
+	}
+	s.PublishIndexCandidate(candidate)
+	return nil
+}
+
+// BuildIndexCandidate encodes all names (from cache or the provider) into a new
+// vector index without touching the one currently online.
+func (s *service) BuildIndexCandidate(ctx context.Context, names []string, ids []string) (IndexCandidate, error) {
 	// Apply timeout from config
 	var cancel context.CancelFunc
 	if s.config.IndexBuildTimeout > 0 {
@@ -209,7 +239,7 @@ func (s *service) BuildIndex(ctx context.Context, names []string, ids []string) 
 	defer span.End()
 
 	if len(names) != len(ids) {
-		return fmt.Errorf("embeddings: names and ids must have same length")
+		return IndexCandidate{}, fmt.Errorf("embeddings: names and ids must have same length")
 	}
 
 	s.logger.Info().Logf("embeddings: building index for %d entities", len(names))
@@ -247,7 +277,7 @@ func (s *service) BuildIndex(ctx context.Context, names []string, ids []string) 
 			// Check for context cancellation
 			select {
 			case <-ctx.Done():
-				return fmt.Errorf("embeddings: build index cancelled: %w", ctx.Err())
+				return IndexCandidate{}, fmt.Errorf("embeddings: build index cancelled: %w", ctx.Err())
 			default:
 			}
 
@@ -259,7 +289,7 @@ func (s *service) BuildIndex(ctx context.Context, names []string, ids []string) 
 			batch := uncachedNames[i:end]
 			embeddings, err := s.provider.Embed(ctx, batch)
 			if err != nil {
-				return fmt.Errorf("embeddings: failed to encode batch %d: %w", i/batchSize, err)
+				return IndexCandidate{}, fmt.Errorf("embeddings: failed to encode batch %d: %w", i/batchSize, err)
 			}
 
 			// Fill in results and cache
@@ -276,16 +306,26 @@ func (s *service) BuildIndex(ctx context.Context, names []string, ids []string) 
 		}
 	}
 
-	// Build the index
-	s.mu.Lock()
-	s.index = newVectorIndex(s.provider.Dimension())
-	s.index.Add(allEmbeddings, ids, names)
-	s.mu.Unlock()
+	// Build the isolated candidate index; s.index is not modified.
+	candidate := IndexCandidate{idx: newVectorIndex(s.provider.Dimension())}
+	candidate.idx.Add(allEmbeddings, ids, names)
 
-	s.logger.Info().Logf("embeddings: index built with %d entities (%d from cache, %d newly encoded)",
+	s.logger.Info().Logf("embeddings: candidate index built with %d entities (%d from cache, %d newly encoded)",
 		len(names), cacheHits, len(uncachedNames))
 
-	return nil
+	return candidate, nil
+}
+
+// PublishIndexCandidate swaps the online vector index. The previous index
+// stays available to in-flight searches until their RLock is released.
+func (s *service) PublishIndexCandidate(candidate IndexCandidate) {
+	if candidate.idx == nil {
+		return
+	}
+	s.mu.Lock()
+	s.index = candidate.idx
+	s.mu.Unlock()
+	s.logger.Info().Logf("embeddings: index published with %d entities", candidate.idx.Size())
 }
 
 // Search finds similar names using vector similarity.

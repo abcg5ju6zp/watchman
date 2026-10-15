@@ -18,26 +18,35 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func loadSenzingRecords(ctx context.Context, logger log.Logger, config Config, ignoredLists []search.SourceList, responseCh chan preparedList) error {
+func loadSenzingRecords(
+	ctx context.Context,
+	logger log.Logger,
+	config Config,
+	ignoredLists []search.SourceList,
+	responseCh chan preparedList,
+	recordFailure func(source search.SourceList, cause error, allowed bool),
+) error {
 	params := senzingDownload{
-		lists:        config.Senzing,
-		config:       config,
-		ignoredLists: ignoredLists,
+		lists:         config.Senzing,
+		config:        config,
+		ignoredLists:  ignoredLists,
+		recordFailure: recordFailure,
 	}
 	return prepareSenzingRecords(ctx, logger, params, responseCh)
 }
 
 type senzingDownload struct {
-	lists        []SenzingList
-	config       Config
-	ignoredLists []search.SourceList
+	lists         []SenzingList
+	config        Config
+	ignoredLists  []search.SourceList
+	recordFailure func(source search.SourceList, cause error, allowed bool)
 
 	downloadOptions []download.Option
 }
 
 func prepareSenzingRecords(ctx context.Context, logger log.Logger, params senzingDownload, responseCh chan preparedList) error {
 	dl := download.New(logger, nil, params.downloadOptions...)
-	initialDir := initialDataDirectory(params.config)
+	initialDir := effectiveDataDirectory(params.config)
 
 	// Download and process each list individually so that failures are
 	// per-source.  This avoids a mixed ignored/non-ignored batch where an
@@ -72,7 +81,13 @@ func processSenzingList(ctx context.Context, logger log.Logger, dl *download.Dow
 	if err != nil {
 		if ignored {
 			logger.Warn().Logf("ignoring download error for %s: %v", source, err)
+			if params.recordFailure != nil {
+				params.recordFailure(source, err, true)
+			}
 			return nil
+		}
+		if params.recordFailure != nil {
+			params.recordFailure(source, err, false)
 		}
 		return fmt.Errorf("loading senzing file %s: %w", source, err)
 	}
@@ -80,11 +95,18 @@ func processSenzingList(ctx context.Context, logger log.Logger, dl *download.Dow
 
 	contents, ok := files[string(source)]
 	if !ok {
+		missingErr := fmt.Errorf("download failed for senzing list %s: file not available", source)
 		if ignored {
 			logger.Warn().Logf("ignoring download failure for %s: file not available", source)
+			if params.recordFailure != nil {
+				params.recordFailure(source, missingErr, true)
+			}
 			return nil
 		}
-		return fmt.Errorf("download failed for senzing list %s: file not available", source)
+		if params.recordFailure != nil {
+			params.recordFailure(source, missingErr, false)
+		}
+		return missingErr
 	}
 
 	r, hashbuf := hashWriter(contents)
@@ -93,17 +115,30 @@ func processSenzingList(ctx context.Context, logger log.Logger, dl *download.Dow
 	if err != nil {
 		if ignored {
 			logger.Warn().Logf("ignoring error parsing %s: %v", source, err)
+			if params.recordFailure != nil {
+				params.recordFailure(source, err, true)
+			}
 			return nil
+		}
+		if params.recordFailure != nil {
+			params.recordFailure(source, err, false)
 		}
 		return fmt.Errorf("parsing %s failed: %w", source, err)
 	}
 
-	if len(entities) == 0 && errorOnEmptyList(params.config) {
+	if len(entities) == 0 && params.config.ErrorOnEmptyList {
+		emptyErr := fmt.Errorf("no entities parsed from senzing list: %#v", source)
 		if ignored {
 			logger.Warn().Logf("ignoring empty list for %s", source)
+			if params.recordFailure != nil {
+				params.recordFailure(source, emptyErr, true)
+			}
 			return nil
 		}
-		return fmt.Errorf("no entities parsed from senzing list: %#v", source)
+		if params.recordFailure != nil {
+			params.recordFailure(source, emptyErr, false)
+		}
+		return emptyErr
 	}
 
 	responseCh <- preparedList{

@@ -10,6 +10,15 @@ type Config struct {
 	RefreshInterval      time.Duration
 	InitialDataDirectory string
 
+	// RefreshStateDirectory is the root used to stage isolated refresh
+	// generations (downloaded source files + generation manifests) and to
+	// recover an interrupted publish on startup. When empty it defaults to
+	// "<InitialDataDirectory>/.watchman-refresh", or an OS temp directory when
+	// no initial data directory is configured.
+	//
+	// Use the REFRESH_STATE_DIRECTORY environment variable to set this at runtime.
+	RefreshStateDirectory string
+
 	// ErrorOnEmptyList determines whether Watchman should raise an error when a list
 	// becomes empty during refresh or download operations. An empty list could indicate:
 	//   - A parsing error in the list processing logic
@@ -38,6 +47,12 @@ type Config struct {
 
 	OpenSanctions OpenSanctionsConfig
 	Senzing       []SenzingList
+
+	// workingDir, when set, overrides InitialDataDirectory for source file
+	// reads during a coordinated refresh. It points at the isolated candidate
+	// directory of one generation. It is a runtime-only field, never read from
+	// YAML or environment configuration.
+	workingDir string
 }
 
 type OpenSanctionsConfig struct {

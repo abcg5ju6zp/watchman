@@ -1079,6 +1079,41 @@ components:
         lastError:
           type: string
           description: Error message from the most recent failed refresh, if any
+        generationId:
+          type: string
+          example: "gen-20260901T120000.000000-ab12cd34"
+          description: Identifier of the data generation currently published online
+        sources:
+          type: array
+          description: Per-source provenance of the published generation
+          items:
+            $ref: '#/components/schemas/RefreshSourceStatus'
+      type: object
+    RefreshSourceStatus:
+      properties:
+        source:
+          type: string
+          example: us_ofac
+          description: Source list name
+        entities:
+          type: integer
+          example: 12345
+          description: Number of entities served for the source in this generation
+        hash:
+          type: string
+          description: SHA-256 hash of the source data used by the generation
+        fresh:
+          type: boolean
+          description: True when the source was downloaded for this generation
+        stale:
+          type: boolean
+          description: True when the source failed to refresh and its previous generation data is being served
+        priorGenerationId:
+          type: string
+          description: Generation the stale data was carried over from
+        error:
+          type: string
+          description: Download or parse error when the source failed to refresh
       type: object
     Organization:
       properties:

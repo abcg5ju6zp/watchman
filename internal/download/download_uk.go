@@ -27,7 +27,7 @@ func loadUKCSLRecords(ctx context.Context, logger log.Logger, conf Config, respo
 	start := time.Now()
 
 	// Download UK Sanctions List (CSV format)
-	files, err := csl_uk.DownloadSanctionsList(ctx, logger, initialDataDirectory(conf))
+	files, err := csl_uk.DownloadSanctionsList(ctx, logger, effectiveDataDirectory(conf))
 	if err != nil {
 		return fmt.Errorf("UK CSL download: %w", err)
 	}
@@ -76,7 +76,7 @@ func loadUKCSLRecords(ctx context.Context, logger log.Logger, conf Config, respo
 	logger.Debug().Logf("finished UK CSL preparation: %d entities in %v", len(entities), time.Since(start))
 	span.AddEvent("finished UK CSL preparation")
 
-	if len(entities) == 0 && errorOnEmptyList(conf) {
+	if len(entities) == 0 && conf.ErrorOnEmptyList {
 		return errors.New("no entities parsed from UK CSL")
 	}
 

@@ -17,6 +17,12 @@ import (
 )
 
 func setupPeriodicRefreshing(ctx context.Context, logger log.Logger, errs chan error, conf download.Config, r *download.Refresher) error {
+	// Resolve any candidate left by a process exit during the previous publish:
+	// complete the same pinned generation or discard it before any new download.
+	if err := r.Recover(ctx); err != nil {
+		logger.Warn().LogErrorf("problem recovering interrupted refresh, starting a fresh generation: %v", err)
+	}
+
 	// Initial, blocking load. A failure here is fatal to startup — we have no data yet.
 	if err := r.RefreshNow(ctx, download.TriggerStartup); err != nil {
 		return err

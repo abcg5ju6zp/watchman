@@ -21,12 +21,35 @@ type Lists interface {
 	// government-ID / address blocking keys, with safe fallbacks that never reduce
 	// recall below a full partition scan.
 	SelectCandidates(ctx context.Context, query search.Entity[search.Value]) (Candidates, error)
+
+	// Update builds and publishes a new generation in one step. Refreshes use
+	// PrepareCandidate/PublishCandidate instead so a failed embedding build can
+	// never leave the online view on a newer text generation.
 	Update(latest download.Stats)
+
+	// PrepareCandidate builds the text corpus and TF-IDF structures for latest
+	// without touching the online view. PublishCandidate swaps them in.
+	PrepareCandidate(latest download.Stats) download.TextCandidate
+	PublishCandidate(candidate download.TextCandidate)
+
+	// PriorSource returns the currently published generation's data for one
+	// source so an allowed-to-fail refresh can carry it over.
+	PriorSource(source search.SourceList) (download.PriorSource, bool)
+
 	LatestStats() download.Stats
 	GetTFIDFIndex() *tfidf.Index
 	// RefreshIngest rebuilds the ingested-file corpus from the repository.
 	RefreshIngest(ctx context.Context) error
 }
+
+// Candidate is a prepared but not yet published text generation.
+type Candidate struct {
+	corpus *corpus
+	meta   download.Stats
+}
+
+// IsRefreshCandidate marks Candidate as a download.TextCandidate.
+func (c *Candidate) IsRefreshCandidate() {}
 
 func NewLists(ingestRepository ingest.Repository) Lists {
 	return &lists{
@@ -185,16 +208,28 @@ func (l *lists) LatestStats() download.Stats {
 		}
 	}
 
+	results := l.latestStats.SourceResults
+	if len(results) > 0 {
+		results = make(map[string]download.SourceResult, len(l.latestStats.SourceResults))
+		for k, v := range l.latestStats.SourceResults {
+			results[k] = v
+		}
+	}
+
 	return download.Stats{
-		Lists:      lists,
-		ListHashes: hashes,
-		StartedAt:  l.latestStats.StartedAt,
-		EndedAt:    l.latestStats.EndedAt,
-		Version:    watchman.Version,
+		Lists:         lists,
+		ListHashes:    hashes,
+		SourceResults: results,
+		StartedAt:     l.latestStats.StartedAt,
+		EndedAt:       l.latestStats.EndedAt,
+		Version:       watchman.Version,
+		GenerationID:  l.latestStats.GenerationID,
 	}
 }
 
-// Update replaces the searchable corpus with a newly downloaded generation.
+// Update builds and immediately publishes a new generation. The coordinated
+// refresh path uses PrepareCandidate and PublishCandidate separately so the
+// online view only advances once every enabled capability is ready.
 //
 // Memory ownership after Update:
 //   - The entity slice and TF-IDF index live only on the in-memory corpus.
@@ -205,22 +240,39 @@ func (l *lists) LatestStats() download.Stats {
 // and FreeOSMemory after the swap to reduce refresh peak RSS / OOM risk when the
 // old and new corpora would otherwise coexist until the next natural GC cycle.
 func (l *lists) Update(latest download.Stats) {
-	// Build search corpus outside the write lock (CPU-heavy).
+	l.PublishCandidate(l.PrepareCandidate(latest))
+}
+
+// PrepareCandidate builds the search corpus and metadata for latest without
+// changing the online view. The returned candidate is immutable and safe to
+// discard if a later refresh stage (e.g. the embedding build) fails.
+func (l *lists) PrepareCandidate(latest download.Stats) download.TextCandidate {
+	// Build search corpus outside any lock (CPU-heavy).
 	// corpus.entities aliases latest.Entities (no extra copy of the slice).
 	c := buildCorpus(latest.Entities, latest.TFIDFIndex)
 
 	// Metadata only — do not retain a second root to the entity slice / TF-IDF
-	// via latestStats (LatestStats() already omitted Entities; this makes the
-	// in-process graph match that intent).
+	// index via latestStats.
 	meta := latest
 	meta.Entities = nil
 	meta.TFIDFIndex = nil
 
+	return &Candidate{corpus: c, meta: meta}
+}
+
+// PublishCandidate atomically swaps the online view onto candidate. It must be
+// called only after every enabled capability for the generation is prepared.
+func (l *lists) PublishCandidate(candidate download.TextCandidate) {
+	c, ok := candidate.(*Candidate)
+	if !ok || c == nil {
+		return
+	}
+
 	l.mu.Lock()
 	// Overwriting l.corpus drops the only lists-owned root to the previous
 	// generation; nothing else in this frame retains it.
-	l.latestStats = meta
-	l.corpus = c
+	l.latestStats = c.meta
+	l.corpus = c.corpus
 	l.mu.Unlock()
 
 	// Refresh is infrequent; reclaim the prior generation promptly so cgroup
@@ -228,6 +280,27 @@ func (l *lists) Update(latest download.Stats) {
 	// pages to the OS (important after large refreshes).
 	runtime.GC()
 	debug.FreeOSMemory()
+}
+
+// PriorSource returns the published generation's entities and metadata for one
+// source. The returned entities are value copies safe to reuse while the live
+// corpus keeps serving readers.
+func (l *lists) PriorSource(source search.SourceList) (download.PriorSource, bool) {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+
+	if l.corpus == nil {
+		return download.PriorSource{}, false
+	}
+	idxs, ok := l.corpus.partitionIndices(source, "")
+	if !ok || len(idxs) == 0 {
+		return download.PriorSource{}, false
+	}
+	return download.PriorSource{
+		Entities:     l.corpus.materialize(idxs),
+		Hash:         l.latestStats.ListHashes[string(source)],
+		GenerationID: l.latestStats.GenerationID,
+	}, true
 }
 
 func (l *lists) GetTFIDFIndex() *tfidf.Index {

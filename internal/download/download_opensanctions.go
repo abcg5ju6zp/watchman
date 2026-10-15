@@ -15,11 +15,19 @@ import (
 	"github.com/moov-io/watchman/pkg/search"
 )
 
-func loadOpensanctionsRecords(ctx context.Context, logger log.Logger, config Config, ignoredLists []search.SourceList, responseCh chan preparedList) error {
+func loadOpensanctionsRecords(
+	ctx context.Context,
+	logger log.Logger,
+	config Config,
+	ignoredLists []search.SourceList,
+	responseCh chan preparedList,
+	recordFailure func(source search.SourceList, cause error, allowed bool),
+) error {
 	params := senzingDownload{
-		lists:        config.OpenSanctions.Lists,
-		config:       config,
-		ignoredLists: ignoredLists,
+		lists:         config.OpenSanctions.Lists,
+		config:        config,
+		ignoredLists:  ignoredLists,
+		recordFailure: recordFailure,
 	}
 
 	if len(params.lists) == 0 {

@@ -126,7 +126,18 @@ func main() {
 		logger.Fatal().LogErrorf("problem setting up search service: %v", err)
 		os.Exit(1)
 	}
-	refreshManager := download.NewRefresher(ctx, logger, downloader, indexedLists, searchService)
+
+	// Durable candidate staging and startup recovery for atomic refreshes.
+	// A missing state directory never blocks startup; refreshes still work in
+	// memory, they just cannot be resumed across a process exit mid-publish.
+	var refresherOpts []download.Option
+	generationStore, storeErr := download.NewGenerationStore(logger, conf.Download)
+	if storeErr != nil {
+		logger.Warn().Logf("problem setting up refresh state directory, running without durable recovery: %v", storeErr)
+	} else {
+		refresherOpts = append(refresherOpts, download.WithGenerationStore(generationStore))
+	}
+	refreshManager := download.NewRefresher(ctx, logger, downloader, indexedLists, searchService, refresherOpts...)
 	err = setupPeriodicRefreshing(ctx, logger, errs, conf.Download, refreshManager)
 	if err != nil {
 		logger.Fatal().LogErrorf("problem during initial download: %v", err)

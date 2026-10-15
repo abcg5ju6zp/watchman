@@ -27,7 +27,7 @@ func loadEUCSLRecords(ctx context.Context, logger log.Logger, conf Config, respo
 	start := time.Now()
 
 	// Download EU CSL CSV file
-	files, err := csl_eu.DownloadEU(ctx, logger, initialDataDirectory(conf))
+	files, err := csl_eu.DownloadEU(ctx, logger, effectiveDataDirectory(conf))
 	if err != nil {
 		return fmt.Errorf("EU CSL download: %w", err)
 	}
@@ -76,7 +76,7 @@ func loadEUCSLRecords(ctx context.Context, logger log.Logger, conf Config, respo
 	logger.Debug().Logf("finished EU CSL preparation: %d entities in %v", len(entities), time.Since(start))
 	span.AddEvent("finished EU CSL preparation")
 
-	if len(entities) == 0 && errorOnEmptyList(conf) {
+	if len(entities) == 0 && conf.ErrorOnEmptyList {
 		return errors.New("no entities parsed from EU CSL")
 	}
 

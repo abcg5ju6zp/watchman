@@ -44,6 +44,17 @@ type Service interface {
 	// RebuildEmbeddingIndex rebuilds the embedding index from current entities.
 	// This should be called after the entity list has been updated.
 	RebuildEmbeddingIndex(ctx context.Context) error
+
+	// EmbeddingsEnabled reports whether vector matching is configured.
+	EmbeddingsEnabled() bool
+
+	// PrepareEmbeddingIndex builds a vector index for the candidate entities
+	// without changing the online index, so a refresh can publish text and
+	// vector indexes from the same generation atomically.
+	PrepareEmbeddingIndex(ctx context.Context, names, ids []string) (embeddings.IndexCandidate, error)
+
+	// PublishEmbeddingIndex swaps the online vector index.
+	PublishEmbeddingIndex(candidate embeddings.IndexCandidate)
 }
 
 func NewService(logger log.Logger, config Config, database db.DB, indexedLists index.Lists) (Service, error) {
@@ -79,6 +90,13 @@ type service struct {
 
 	// searchSem limits concurrent full-corpus searches to avoid goroutine oversubscription
 	searchSem chan struct{}
+
+	// publishMu makes a generation publication atomic relative to searches.
+	// Searches hold RLock for their whole duration; PublishGeneration takes
+	// Lock while swapping the text corpus and vector index together, so no
+	// request can ever read one capability from a new generation and the other
+	// from the previous one.
+	publishMu sync.RWMutex
 }
 
 func (s *service) LatestStats() download.Stats {
@@ -86,6 +104,12 @@ func (s *service) LatestStats() download.Stats {
 }
 
 func (s *service) Search(ctx context.Context, query search.Entity[search.Value], opts SearchOpts) ([]search.SearchedEntity[search.Value], error) {
+	// Pin this request to one generation for its whole duration: a concurrent
+	// publication swaps the text corpus and vector index while holding the
+	// writer lock and therefore cannot land in the middle of a request.
+	s.publishMu.RLock()
+	defer s.publishMu.RUnlock()
+
 	ctx, span := telemetry.StartSpan(ctx, "search", trace.WithAttributes(
 		attribute.String("query.type", string(query.Type)),
 		attribute.String("query.source", string(query.Source)),
@@ -488,4 +512,42 @@ func (s *service) RebuildEmbeddingIndex(ctx context.Context) error {
 
 	s.logger.Info().Logf("embeddings: index rebuilt successfully")
 	return nil
+}
+
+// EmbeddingsEnabled reports whether the optional vector matching capability
+// is configured.
+func (s *service) EmbeddingsEnabled() bool {
+	return s.embeddings != nil
+}
+
+// PrepareEmbeddingIndex builds a candidate vector index for one refresh
+// generation without touching the online index.
+func (s *service) PrepareEmbeddingIndex(ctx context.Context, names, ids []string) (embeddings.IndexCandidate, error) {
+	if s.embeddings == nil {
+		return embeddings.IndexCandidate{}, nil
+	}
+	return s.embeddings.BuildIndexCandidate(ctx, names, ids)
+}
+
+// PublishEmbeddingIndex atomically swaps the online vector index to candidate.
+func (s *service) PublishEmbeddingIndex(candidate embeddings.IndexCandidate) {
+	if s.embeddings == nil {
+		return
+	}
+	s.embeddings.PublishIndexCandidate(candidate)
+}
+
+// PublishGeneration swaps the text corpus and the vector index as one atomic
+// step relative to in-flight Searches. Both candidates must have been built
+// from the same entity generation beforehand.
+func (s *service) PublishGeneration(textCandidate download.TextCandidate, embeddingCandidate embeddings.IndexCandidate) {
+	s.publishMu.Lock()
+	defer s.publishMu.Unlock()
+
+	if textCandidate != nil {
+		s.indexedLists.PublishCandidate(textCandidate)
+	}
+	if s.embeddings != nil {
+		s.embeddings.PublishIndexCandidate(embeddingCandidate)
+	}
 }

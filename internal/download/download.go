@@ -43,6 +43,49 @@ type downloader struct {
 	logger   log.Logger
 	conf     Config
 	geocoder GeocodingService
+
+	// runtime is set by the Refresher for a coordinated, generation-pinned
+	// refresh and reset afterward. Direct RefreshAll callers (tests, one-off
+	// loads) leave it nil and retain the historical behavior.
+	runtime *refreshRuntime
+}
+
+// refreshRuntime binds one RefreshAll call to an isolated generation.
+type refreshRuntime struct {
+	// workingDir is the candidate data directory; source files are read from
+	// (and written into) it instead of the configured initial data directory.
+	workingDir string
+
+	// generationID is stamped onto the returned Stats.
+	generationID string
+
+	// prior provides the currently published generation so sources whose
+	// failure is allowed can carry the previous generation's data.
+	prior PriorData
+
+	// workspace, when set, receives the previous generation's raw files when
+	// at least one source has to be carried over (best effort, for recovery).
+	workspace *GenerationWorkspace
+}
+
+// refreshRuntimeSetter is implemented by the production downloader so the
+// Refresher can bind a generation without exposing the concrete type.
+type refreshRuntimeSetter interface {
+	SetRefreshRuntime(rt *refreshRuntime)
+}
+
+func (dl *downloader) SetRefreshRuntime(rt *refreshRuntime) {
+	dl.runtime = rt
+}
+
+// effectiveDataDirectory returns the directory source loaders should use for
+// one refresh: the isolated candidate directory when a runtime is bound,
+// otherwise the configured initial data directory.
+func effectiveDataDirectory(conf Config) string {
+	if conf.workingDir != "" {
+		return conf.workingDir
+	}
+	return initialDataDirectory(conf)
 }
 
 // knownDownloadableLists is the set of standard built-in lists that watchman
@@ -64,10 +107,21 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 
 	start := time.Now()
 
+	// Bind this call to its pinned generation: source files are staged in, and
+	// read from, the candidate's isolated data directory.
+	conf := dl.conf
+	generationID := ""
+	if dl.runtime != nil {
+		conf.workingDir = dl.runtime.workingDir
+		generationID = dl.runtime.generationID
+	}
+
 	stats := Stats{
-		Lists:      make(map[string]int),
-		ListHashes: make(map[string]string),
-		StartedAt:  time.Now().In(time.UTC),
+		Lists:         make(map[string]int),
+		ListHashes:    make(map[string]string),
+		SourceResults: make(map[string]SourceResult),
+		StartedAt:     time.Now().In(time.UTC),
+		GenerationID:  generationID,
 	}
 
 	// Validate IgnoredDownloadErrors before spawning any goroutines so we can
@@ -78,8 +132,19 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 	}
 
 	logger := dl.logger.Info().With(log.Fields{
-		"initial_data_directory": log.String(expandInitialDir(initialDataDirectory(dl.conf))),
+		"initial_data_directory": log.String(expandInitialDir(effectiveDataDirectory(conf))),
+		"generation_id":          log.String(generationID),
 	})
+
+	// Collect every source load failure (required and allowed) so provenance
+	// and refresh Status can distinguish the two after producers finish.
+	var failuresMu sync.Mutex
+	var loadFailures []loadFailure
+	recordFailure := func(source search.SourceList, cause error, allowed bool) {
+		failuresMu.Lock()
+		loadFailures = append(loadFailures, loadFailure{source: source, err: cause, allowed: allowed})
+		failuresMu.Unlock()
+	}
 
 	g, ctx := errgroup.WithContext(ctx)
 	preparedLists := make(chan preparedList, 10)
@@ -111,8 +176,15 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 
 			logger.Info().Logf("adding %d entities from %v", len(entities), list.ListName)
 
-			stats.Lists[string(list.ListName)] = len(entities)
-			stats.ListHashes[string(list.ListName)] = list.Hash
+			name := string(list.ListName)
+			stats.Lists[name] = len(entities)
+			stats.ListHashes[name] = list.Hash
+			stats.SourceResults[name] = SourceResult{
+				Name:     name,
+				Entities: len(entities),
+				Hash:     list.Hash,
+				Fresh:    true,
+			}
 
 			stats.Entities = append(stats.Entities, entities...)
 		}
@@ -122,7 +194,7 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 	var producerWg sync.WaitGroup
 
 	// Track what lists have been requested and loaded
-	requestedLists := getIncludedLists(dl.conf)
+	requestedLists := getIncludedLists(conf)
 	var listsLoaded []search.SourceList
 
 	if len(requestedLists) == 0 {
@@ -138,10 +210,9 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 		g.Go(func() error {
 			defer producerWg.Done()
 
-			err := loadOFACRecords(ctx, logger, dl.conf, preparedLists)
+			err := loadOFACRecords(ctx, logger, conf, preparedLists)
 			if err != nil {
-				if slices.Contains(ignoredLists, search.SourceUSOFAC) {
-					logger.Warn().Logf("ignoring error loading %s: %v", search.SourceUSOFAC, err)
+				if handleLoadError(logger, search.SourceUSOFAC, ignoredLists, err, recordFailure) {
 					return nil
 				}
 				return fmt.Errorf("loading OFAC records: %w", err)
@@ -158,10 +229,9 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 		g.Go(func() error {
 			defer producerWg.Done()
 
-			err := loadUSNonSDNRecords(ctx, logger, dl.conf, preparedLists)
+			err := loadUSNonSDNRecords(ctx, logger, conf, preparedLists)
 			if err != nil {
-				if slices.Contains(ignoredLists, search.SourceUSNonSDN) {
-					logger.Warn().Logf("ignoring error loading %s: %v", search.SourceUSNonSDN, err)
+				if handleLoadError(logger, search.SourceUSNonSDN, ignoredLists, err, recordFailure) {
 					return nil
 				}
 				return fmt.Errorf("loading OFAC Non-SDN records: %w", err)
@@ -178,10 +248,9 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 		g.Go(func() error {
 			defer producerWg.Done()
 
-			err := loadCSLUSRecords(ctx, logger, dl.conf, preparedLists)
+			err := loadCSLUSRecords(ctx, logger, conf, preparedLists)
 			if err != nil {
-				if slices.Contains(ignoredLists, search.SourceUSCSL) {
-					logger.Warn().Logf("ignoring error loading %s: %v", search.SourceUSCSL, err)
+				if handleLoadError(logger, search.SourceUSCSL, ignoredLists, err, recordFailure) {
 					return nil
 				}
 				return fmt.Errorf("loading US CSL records: %w", err)
@@ -198,10 +267,9 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 		g.Go(func() error {
 			defer producerWg.Done()
 
-			err := loadFinCEN311Records(ctx, logger, dl.conf, preparedLists)
+			err := loadFinCEN311Records(ctx, logger, conf, preparedLists)
 			if err != nil {
-				if slices.Contains(ignoredLists, search.SourceUSFinCEN311) {
-					logger.Warn().Logf("ignoring error loading %s: %v", search.SourceUSFinCEN311, err)
+				if handleLoadError(logger, search.SourceUSFinCEN311, ignoredLists, err, recordFailure) {
 					return nil
 				}
 				return fmt.Errorf("loading FinCEN 311 records: %w", err)
@@ -218,10 +286,9 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 		g.Go(func() error {
 			defer producerWg.Done()
 
-			err := loadUKCSLRecords(ctx, logger, dl.conf, preparedLists)
+			err := loadUKCSLRecords(ctx, logger, conf, preparedLists)
 			if err != nil {
-				if slices.Contains(ignoredLists, search.SourceUKCSL) {
-					logger.Warn().Logf("ignoring error loading %s: %v", search.SourceUKCSL, err)
+				if handleLoadError(logger, search.SourceUKCSL, ignoredLists, err, recordFailure) {
 					return nil
 				}
 				return fmt.Errorf("loading UK CSL records: %w", err)
@@ -238,10 +305,9 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 		g.Go(func() error {
 			defer producerWg.Done()
 
-			err := loadEUCSLRecords(ctx, logger, dl.conf, preparedLists)
+			err := loadEUCSLRecords(ctx, logger, conf, preparedLists)
 			if err != nil {
-				if slices.Contains(ignoredLists, search.SourceEUCSL) {
-					logger.Warn().Logf("ignoring error loading %s: %v", search.SourceEUCSL, err)
+				if handleLoadError(logger, search.SourceEUCSL, ignoredLists, err, recordFailure) {
 					return nil
 				}
 				return fmt.Errorf("loading EU CSL records: %w", err)
@@ -251,14 +317,14 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 	}
 
 	// OpenSanctions lists
-	for _, list := range dl.conf.OpenSanctions.Lists {
+	for _, list := range conf.OpenSanctions.Lists {
 		listsLoaded = append(listsLoaded, normalizeListName(list.SourceList))
 	}
 	producerWg.Add(1)
 	g.Go(func() error {
 		defer producerWg.Done()
 
-		err := loadOpensanctionsRecords(ctx, logger, dl.conf, ignoredLists, preparedLists)
+		err := loadOpensanctionsRecords(ctx, logger, conf, ignoredLists, preparedLists, recordFailure)
 		if err != nil {
 			return fmt.Errorf("loading opensanctions lists: %w", err)
 		}
@@ -266,14 +332,14 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 	})
 
 	// Senzing lists
-	for _, list := range dl.conf.Senzing {
+	for _, list := range conf.Senzing {
 		listsLoaded = append(listsLoaded, normalizeListName(list.SourceList))
 	}
 	producerWg.Add(1)
 	g.Go(func() error {
 		defer producerWg.Done()
 
-		err := loadSenzingRecords(ctx, logger, dl.conf, ignoredLists, preparedLists)
+		err := loadSenzingRecords(ctx, logger, conf, ignoredLists, preparedLists, recordFailure)
 		if err != nil {
 			return fmt.Errorf("loading senzing lists: %w", err)
 		}
@@ -288,10 +354,9 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 		g.Go(func() error {
 			defer producerWg.Done()
 
-			err := loadUNCSLRecords(ctx, logger, dl.conf, preparedLists)
+			err := loadUNCSLRecords(ctx, logger, conf, preparedLists)
 			if err != nil {
-				if slices.Contains(ignoredLists, search.SourceUNCSL) {
-					logger.Warn().Logf("ignoring error loading %s: %v", search.SourceUNCSL, err)
+				if handleLoadError(logger, search.SourceUNCSL, ignoredLists, err, recordFailure) {
 					return nil
 				}
 				return fmt.Errorf("loading UN CSL records: %w", err)
@@ -308,10 +373,9 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 		g.Go(func() error {
 			defer producerWg.Done()
 
-			err := loadUSTelRecords(ctx, logger, dl.conf, preparedLists)
+			err := loadUSTelRecords(ctx, logger, conf, preparedLists)
 			if err != nil {
-				if slices.Contains(ignoredLists, search.SourceUSTEL) {
-					logger.Warn().Logf("ignoring error loading %s: %v", search.SourceUSTEL, err)
+				if handleLoadError(logger, search.SourceUSTEL, ignoredLists, err, recordFailure) {
 					return nil
 				}
 				return fmt.Errorf("loading US TEL records: %w", err)
@@ -344,18 +408,115 @@ func (dl *downloader) RefreshAll(ctx context.Context) (Stats, error) {
 	err := g.Wait()
 	<-resultsDone
 
+	// Resolve failed sources. Allowed failures keep serving the explicit
+	// previous generation's data for that source; required failures mark the
+	// candidate unpublishable.
+	applyLoadFailures(logger, dl.runtime, stats, loadFailures)
+
 	if err != nil {
+		// A required source failed: do not carry this generation forward.
+		// Stats (including per-source errors) are returned only for Status.
 		return stats, fmt.Errorf("problem loading lists: %v", err)
 	}
 
 	logger.Info().Logf("finished all lists: %v", time.Since(start))
 
-	// Build TF-IDF index from all entity names
+	// Build TF-IDF index from all entity names (fresh downloads + any data
+	// explicitly carried over from the previous generation).
 	stats.TFIDFIndex = buildTFIDFIndex(logger, stats.Entities)
 
 	stats.EndedAt = time.Now().In(time.UTC)
 
 	return stats, nil
+}
+
+// loadFailure records one source load error and whether the source is allowed
+// to fail.
+type loadFailure struct {
+	source  search.SourceList
+	err     error
+	allowed bool
+}
+
+// handleLoadError logs a source load failure, records it for provenance and
+// returns true when the failure is allowed (the source is in ignoredLists).
+func handleLoadError(
+	logger log.Logger,
+	source search.SourceList,
+	ignoredLists []search.SourceList,
+	cause error,
+	record func(source search.SourceList, cause error, allowed bool),
+) bool {
+	allowed := slices.Contains(ignoredLists, source)
+	if allowed {
+		logger.Warn().Logf("ignoring error loading %s: %v", source, cause)
+	}
+	if record != nil {
+		record(source, cause, allowed)
+	}
+	return allowed
+}
+
+// applyLoadFailures converts recorded source failures into Stats provenance.
+// Allowed failures carry the previous generation's data for the failed source
+// (when available) and are marked stale; required failures are surfaced with
+// their error and publish nothing.
+func applyLoadFailures(logger log.Logger, rt *refreshRuntime, stats Stats, failures []loadFailure) {
+	for _, failure := range failures {
+		name := string(failure.source)
+		if failure.err == nil {
+			continue
+		}
+
+		if !failure.allowed {
+			if cur, ok := stats.SourceResults[name]; ok {
+				cur.Error = failure.err.Error()
+				cur.Fresh = false
+				stats.SourceResults[name] = cur
+			} else {
+				stats.SourceResults[name] = SourceResult{
+					Name:  name,
+					Fresh: false,
+					Error: failure.err.Error(),
+				}
+			}
+			continue
+		}
+
+		result := SourceResult{
+			Name:  name,
+			Fresh: false,
+			Stale: true,
+			Error: failure.err.Error(),
+		}
+
+		if rt != nil && rt.prior != nil {
+			if prior, ok := rt.prior.PriorSource(failure.source); ok && len(prior.Entities) > 0 {
+				// Pin the previous generation's raw files too so the carry-over
+				// survives a process exit and can be rebuilt after recovery.
+				if rt.workspace != nil {
+					if err := rt.workspace.CarryCurrentFiles(); err != nil {
+						logger.Warn().Logf("carrying previous files for %s: %v", name, err)
+					}
+				}
+
+				result.Entities = len(prior.Entities)
+				result.Hash = prior.Hash
+				result.PriorGenerationID = prior.GenerationID
+
+				stats.Lists[name] = len(prior.Entities)
+				stats.ListHashes[name] = prior.Hash
+				stats.Entities = append(stats.Entities, prior.Entities...)
+
+				logger.Warn().Logf("serving %d entities for %s from previous generation %s",
+					len(prior.Entities), name, prior.GenerationID)
+			} else {
+				logger.Warn().Logf("no previous generation data available for %s; source will be empty", name)
+			}
+		}
+
+		stats.SourceResults[name] = result
+	}
 }
 
 // buildTFIDFIndex creates a TF-IDF index from all entity names.

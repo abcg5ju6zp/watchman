@@ -20,7 +20,7 @@ func loadFinCEN311Records(ctx context.Context, logger log.Logger, conf Config, r
 	defer span.End()
 
 	start := time.Now()
-	files, err := fincen_311.Download(ctx, logger, initialDataDirectory(conf))
+	files, err := fincen_311.Download(ctx, logger, effectiveDataDirectory(conf))
 	if err != nil {
 		return fmt.Errorf("FinCEN 311 download: %v", err)
 	}
@@ -46,7 +46,7 @@ func loadFinCEN311Records(ctx context.Context, logger log.Logger, conf Config, r
 	logger.Debug().Logf("finished FinCEN 311 preparation: %v", time.Since(start))
 	span.AddEvent("finished FinCEN 311 preparation")
 
-	if len(entities) == 0 && errorOnEmptyList(conf) {
+	if len(entities) == 0 && conf.ErrorOnEmptyList {
 		return errors.New("no entities parsed from FinCEN 311")
 	}
 

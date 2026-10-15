@@ -20,7 +20,7 @@ func loadOFACRecords(ctx context.Context, logger log.Logger, conf Config, respon
 	defer span.End()
 
 	start := time.Now()
-	files, err := ofac.Download(ctx, logger, initialDataDirectory(conf))
+	files, err := ofac.Download(ctx, logger, effectiveDataDirectory(conf))
 	if err != nil {
 		return fmt.Errorf("OFAC download: %v", err)
 	}
@@ -46,7 +46,7 @@ func loadOFACRecords(ctx context.Context, logger log.Logger, conf Config, respon
 	logger.Debug().Logf("finished OFAC preparation: %v", time.Since(start))
 	span.AddEvent("finished OFAC preparation")
 
-	if len(entities) == 0 && errorOnEmptyList(conf) {
+	if len(entities) == 0 && conf.ErrorOnEmptyList {
 		return errors.New("no entities parsed from US OFAC")
 	}
 
@@ -63,7 +63,7 @@ func loadUSNonSDNRecords(ctx context.Context, logger log.Logger, conf Config, re
 	defer span.End()
 
 	start := time.Now()
-	files, err := us_non_sdn.Download(ctx, logger, initialDataDirectory(conf))
+	files, err := us_non_sdn.Download(ctx, logger, effectiveDataDirectory(conf))
 	if err != nil {
 		return fmt.Errorf("US Non-SDN download: %v", err)
 	}
@@ -92,7 +92,7 @@ func loadUSNonSDNRecords(ctx context.Context, logger log.Logger, conf Config, re
 	logger.Debug().Logf("finished US Non-SDN preparation: %v", time.Since(start))
 	span.AddEvent("finished US Non-SDN preparation")
 
-	if len(entities) == 0 && errorOnEmptyList(conf) {
+	if len(entities) == 0 && conf.ErrorOnEmptyList {
 		return errors.New("no entities parsed from US Non-SDN")
 	}
 
@@ -109,7 +109,7 @@ func loadCSLUSRecords(ctx context.Context, logger log.Logger, conf Config, respo
 	defer span.End()
 
 	start := time.Now()
-	files, err := csl_us.Download(ctx, logger, initialDataDirectory(conf))
+	files, err := csl_us.Download(ctx, logger, effectiveDataDirectory(conf))
 	if err != nil {
 		return fmt.Errorf("US CSL download: %w", err)
 	}
@@ -135,7 +135,7 @@ func loadCSLUSRecords(ctx context.Context, logger log.Logger, conf Config, respo
 	logger.Debug().Logf("finished US CSL preparation: %v", time.Since(start))
 	span.AddEvent("finished US CSL preparation")
 
-	if len(entities) == 0 && errorOnEmptyList(conf) {
+	if len(entities) == 0 && conf.ErrorOnEmptyList {
 		return errors.New("no entities parsed from US CSL")
 	}
 
