@@ -26,6 +26,9 @@ type Lists interface {
 	GetTFIDFIndex() *tfidf.Index
 	// RefreshIngest rebuilds the ingested-file corpus from the repository.
 	RefreshIngest(ctx context.Context) error
+	// IngestVersion reports the source revision/version the live ingest
+	// generation currently serves.
+	IngestVersion(source string) (ingest.SourceChecksum, bool)
 }
 
 func NewLists(ingestRepository ingest.Repository) Lists {
@@ -45,6 +48,8 @@ type lists struct {
 	ingestFingerprint string
 	ingestCounts      map[string]int
 	ingestHashes      map[string]string
+	ingestRevisions   map[string]int64
+	ingestVersions    map[string]string
 }
 
 func (l *lists) downloadedSource(source search.SourceList) bool {

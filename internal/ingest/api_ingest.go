@@ -20,11 +20,6 @@ type Controller interface {
 	AppendRoutes(router *mux.Router) *mux.Router
 }
 
-// IndexCache is the in-memory ingest search index. Optional; tests may pass nil.
-type IndexCache interface {
-	RefreshIngest(ctx context.Context) error
-}
-
 func NewController(logger log.Logger, service Service, conf Config, cache IndexCache) Controller {
 	return &controller{
 		logger:  logger,
@@ -88,38 +83,29 @@ func (c *controller) ingestFile(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 	}
 
-	parsedFile, err := c.service.ReadEntitiesFromFile(ctx, fileType, r.Body)
+	// Parse, transactional replace and confirmed in-memory publish all happen
+	// here. A failure leaves either the previous version or a recoverable
+	// pending publish stage — never a half-replaced source.
+	parsedFile, err := c.service.IngestUpload(ctx, fileType, r.Body, c.cache)
 	if err != nil {
 		if isMaxBytesError(err) {
 			logger.Error().Log("ingest request body too large")
 			api.ErrorResponseStatus(w, http.StatusRequestEntityTooLarge, errRequestBodyTooLarge(maxBytes))
 			return
 		}
+		if errors.Is(err, ErrVersionSuperseded) || errors.Is(err, ErrConcurrentReplacement) {
+			logger.Info().Log("ingest upload lost version arbitration")
+			api.ErrorResponseStatus(w, http.StatusConflict, err)
+			return
+		}
 		// file_type is already attached as a structured field; avoid interpolating
 		// user-controlled values into the log message (CWE-117 / go/log-injection).
-		logger.Error().Log("problem reading entities from file")
+		logger.Error().Log("problem ingesting entities from file")
 		api.ErrorResponse(w, err)
 		return
 	}
 
 	logger.Info().Logf("found %d entities from file", len(parsedFile.Entities))
-
-	// Save the parsed entities
-	err = c.service.ReplaceEntities(ctx, parsedFile.FileType, parsedFile.Entities)
-	if err != nil {
-		logger.Error().Log("problem updating entities")
-		api.ErrorResponse(w, err)
-		return
-	}
-
-	if c.cache != nil {
-		if err := c.cache.RefreshIngest(ctx); err != nil {
-			span.RecordError(err)
-			logger.Error().Logf("problem refreshing ingest search index: %v", err)
-			api.ErrorResponse(w, err)
-			return
-		}
-	}
 
 	// Marshal the response
 	err = api.JsonResponse(w, pubsearch.IngestFileResponse{

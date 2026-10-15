@@ -121,6 +121,11 @@ func main() {
 	if err := indexedLists.RefreshIngest(ctx); err != nil {
 		logger.Warn().Logf("problem loading ingested lists into search index: %v", err)
 	}
+	// Finish publishing any revision committed before a previous process
+	// stopped between the database commit and the in-memory publish.
+	if err := ingestService.RecoverPending(ctx, indexedLists); err != nil {
+		logger.Warn().Logf("problem recovering pending ingested versions: %v", err)
+	}
 	searchService, err := search.NewService(logger, conf.Search, database, indexedLists)
 	if err != nil {
 		logger.Fatal().LogErrorf("problem setting up search service: %v", err)

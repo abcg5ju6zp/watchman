@@ -203,7 +203,8 @@ func setupIngestAPITest(t *testing.T, fn func(ingestApiSetup)) {
 }
 
 type recordingIngestService struct {
-	reads int
+	reads     int
+	uploadErr error
 }
 
 func (s *recordingIngestService) ReadEntitiesFromFile(_ context.Context, name string, contents io.Reader) (ingest.FileEntities, error) {
@@ -223,8 +224,46 @@ func (s *recordingIngestService) ReplaceEntities(context.Context, string, []pubs
 	return nil
 }
 
+func (s *recordingIngestService) IngestUpload(ctx context.Context, name string, contents io.Reader, _ ingest.IndexCache) (ingest.FileEntities, error) {
+	parsed, err := s.ReadEntitiesFromFile(ctx, name, contents)
+	if err != nil {
+		return parsed, err
+	}
+	if s.uploadErr != nil {
+		return parsed, s.uploadErr
+	}
+	return parsed, nil
+}
+
+func (s *recordingIngestService) RecoverPending(context.Context, ingest.IndexCache) error {
+	return nil
+}
+
 func (s *recordingIngestService) GetEntitiesBySource(context.Context, string) ([]pubsearch.Entity[pubsearch.Value], error) {
 	return nil, nil
+}
+
+func TestIngestFile_VersionArbitrationConflict(t *testing.T) {
+	cases := map[string]error{
+		"superseded":         ingest.ErrVersionSuperseded,
+		"concurrent replace": ingest.ErrConcurrentReplacement,
+	}
+	for name, uploadErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			logger := log.NewTestLogger()
+			svc := &recordingIngestService{uploadErr: uploadErr}
+			controller := ingest.NewController(logger, svc, ingest.Config{}, nil)
+
+			router := mux.NewRouter()
+			controller.AppendRoutes(router)
+
+			req := httptest.NewRequest("POST", "/v2/ingest/custom", bytes.NewReader([]byte("id,name\n1,ok\n")))
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, req)
+
+			require.Equal(t, http.StatusConflict, w.Code)
+		})
+	}
 }
 
 func TestIngestFile_MaxBodyBytes(t *testing.T) {
