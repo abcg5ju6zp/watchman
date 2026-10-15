@@ -9,16 +9,31 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// putCacheVector stores a vector as a fully identified cache entry.
+func putCacheVector(t *testing.T, c Cache, text string, embedding []float64) {
+	t.Helper()
+	err := c.Put(context.Background(), text, cacheEntry{
+		Vector:      cloneVector(embedding),
+		ModelKey:    "test-model",
+		Dimension:   len(embedding),
+		ContentHash: hashContent(text),
+	})
+	require.NoError(t, err)
+}
+
 func TestEmbeddingCache_PutGet(t *testing.T) {
 	forEachCache(t, 100, func(c Cache) {
 		ctx := context.Background()
 
 		embedding := []float64{0.1, 0.2, 0.3}
-		c.Put(ctx, "test", embedding)
+		putCacheVector(t, c, "test", embedding)
 
-		retrieved, ok := c.Get(ctx, "test")
+		entry, ok := c.Get(ctx, "test")
 		require.True(t, ok)
-		require.Equal(t, embedding, retrieved)
+		require.Equal(t, embedding, entry.Vector)
+		require.Equal(t, "test-model", entry.ModelKey)
+		require.Equal(t, 3, entry.Dimension)
+		require.Equal(t, hashContent("test"), entry.ContentHash)
 	})
 }
 
@@ -37,9 +52,9 @@ func TestEmbeddingCache_Memory_Eviction(t *testing.T) {
 	c, err := newMemoryCache(2)
 	require.NoError(t, err)
 
-	c.Put(ctx, "a", []float64{1})
-	c.Put(ctx, "b", []float64{2})
-	c.Put(ctx, "c", []float64{3}) // Should evict "a"
+	putCacheVector(t, c, "a", []float64{1})
+	putCacheVector(t, c, "b", []float64{2})
+	putCacheVector(t, c, "c", []float64{3}) // Should evict "a"
 
 	_, ok := c.Get(ctx, "a")
 	require.False(t, ok, "Expected 'a' to be evicted")
@@ -52,28 +67,24 @@ func TestEmbeddingCache_Memory_Eviction(t *testing.T) {
 }
 
 func TestEmbeddingCache_Memory_Size(t *testing.T) {
-	ctx := context.Background()
-
 	cache, err := newMemoryCache(100)
 	require.NoError(t, err)
 
 	require.Equal(t, 0, cache.Size())
 
-	cache.Put(ctx, "a", []float64{1})
+	putCacheVector(t, cache, "a", []float64{1})
 	require.Equal(t, 1, cache.Size())
 
-	cache.Put(ctx, "b", []float64{2})
+	putCacheVector(t, cache, "b", []float64{2})
 	require.Equal(t, 2, cache.Size())
 }
 
 func TestEmbeddingCache_Memory_Clear(t *testing.T) {
-	ctx := context.Background()
-
 	cache, err := newMemoryCache(100)
 	require.NoError(t, err)
 
-	cache.Put(ctx, "a", []float64{1})
-	cache.Put(ctx, "b", []float64{2})
+	putCacheVector(t, cache, "a", []float64{1})
+	putCacheVector(t, cache, "b", []float64{2})
 	require.Equal(t, 2, cache.Size())
 
 	cache.Clear()
@@ -85,15 +96,15 @@ func TestEmbeddingCache_CopyOnPut(t *testing.T) {
 		ctx := context.Background()
 
 		original := []float64{1, 2, 3}
-		c.Put(ctx, "test", original)
+		putCacheVector(t, c, "test", original)
 
 		// Modify original
 		original[0] = 999
 
 		// Retrieved should be unchanged
-		retrieved, ok := c.Get(ctx, "test")
+		entry, ok := c.Get(ctx, "test")
 		require.True(t, ok)
-		require.Equal(t, float64(1), retrieved[0], "Cache should store a copy, not a reference")
+		require.Equal(t, float64(1), entry.Vector[0], "Cache should store a copy, not a reference")
 	})
 }
 
@@ -105,13 +116,11 @@ func TestEmbeddingCache_Memory_DefaultSize(t *testing.T) {
 }
 
 func TestEmbeddingCache_Stats(t *testing.T) {
-	ctx := context.Background()
-
 	cache, err := newMemoryCache(100)
 	require.NoError(t, err)
 
-	cache.Put(ctx, "a", []float64{1})
-	cache.Put(ctx, "b", []float64{2})
+	putCacheVector(t, cache, "a", []float64{1})
+	putCacheVector(t, cache, "b", []float64{2})
 
 	stats := cache.Stats()
 	require.Equal(t, 2, stats.Size)

@@ -35,6 +35,70 @@ func newVectorIndex(dim int) *vectorIndex {
 	}
 }
 
+// verifyCandidate checks a fully assembled candidate index before it is
+// allowed to replace the active index. Every slot must hold a vector of the
+// fixed dimension and every vector must map to exactly one distinct entity.
+// It returns ErrCandidateVerification when any check fails.
+func verifyCandidate(vectors [][]float64, ids, names []string, dim int) error {
+	if dim <= 0 {
+		return fmt.Errorf("%w: invalid dimension %d", ErrCandidateVerification, dim)
+	}
+	if len(vectors) != len(ids) || len(vectors) != len(names) {
+		return fmt.Errorf("%w: vector count %d does not match %d ids and %d names",
+			ErrCandidateVerification, len(vectors), len(ids), len(names))
+	}
+
+	seenIDs := make(map[string]struct{}, len(ids))
+	for i, vec := range vectors {
+		if vec == nil {
+			return fmt.Errorf("%w: missing vector for entity %q at position %d",
+				ErrCandidateVerification, ids[i], i)
+		}
+		if len(vec) != dim {
+			return fmt.Errorf("%w: entity %q vector has dimension %d, expected %d",
+				ErrCandidateVerification, ids[i], len(vec), dim)
+		}
+		if ids[i] == "" {
+			return fmt.Errorf("%w: empty entity id at position %d", ErrCandidateVerification, i)
+		}
+		if _, exists := seenIDs[ids[i]]; exists {
+			return fmt.Errorf("%w: duplicate entity id %q", ErrCandidateVerification, ids[i])
+		}
+		seenIDs[ids[i]] = struct{}{}
+	}
+	return nil
+}
+
+// newVectorIndexFromVectors builds an immutable, fully populated index after
+// verifying vector count, dimensions and entity mapping. The index is built
+// completely offline so callers never observe a partially populated candidate.
+func newVectorIndexFromVectors(dim int, vectors [][]float64, ids, names []string) (*vectorIndex, error) {
+	if err := verifyCandidate(vectors, ids, names, dim); err != nil {
+		return nil, err
+	}
+
+	idx := newVectorIndex(dim)
+
+	// Flatten vectors into contiguous memory
+	total := 0
+	for _, vec := range vectors {
+		total += len(vec)
+	}
+	idx.vectorData = make([]float64, 0, total)
+	for _, vec := range vectors {
+		idx.vectorData = append(idx.vectorData, vec...)
+	}
+
+	idx.ids = append(idx.ids, ids...)
+	idx.names = append(idx.names, names...)
+	for i, id := range ids {
+		idx.idMap[id] = i
+	}
+	idx.count = len(vectors)
+
+	return idx, nil
+}
+
 // Add adds vectors to the index with their corresponding IDs and names.
 func (idx *vectorIndex) Add(vectors [][]float64, ids, names []string) {
 	idx.mu.Lock()
@@ -67,6 +131,14 @@ func (idx *vectorIndex) Search(query []float64, k int) ([]SearchResult, error) {
 
 	if idx.count == 0 {
 		return nil, nil
+	}
+
+	// Never score a query from a different model generation against this
+	// index: the flat layout assumes idx.dim-sized vectors and a mismatch
+	// would silently corrupt results or panic.
+	if len(query) != idx.dim {
+		return nil, fmt.Errorf("%w: query dimension %d, index dimension %d",
+			ErrDimensionMismatch, len(query), idx.dim)
 	}
 
 	scores := make([]scored, idx.count)

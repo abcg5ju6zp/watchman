@@ -35,4 +35,18 @@ var (
 
 	// ErrInvalidResponse indicates an invalid response from the provider.
 	ErrInvalidResponse = errors.New("embeddings: invalid response from provider")
+
+	// ErrCacheWrite indicates an embedding could not be written to the
+	// cache. During an index rebuild the failed vectors are not counted as
+	// confirmed progress and the active index is left untouched.
+	ErrCacheWrite = errors.New("embeddings: failed to persist embedding to cache")
+
+	// ErrCandidateVerification indicates a candidate index failed the
+	// pre-swap checks (vector count, dimensions, or entity mapping).
+	ErrCandidateVerification = errors.New("embeddings: candidate index verification failed")
+
+	// ErrStaleGeneration indicates a rebuild finished after a newer rebuild
+	// had already started; its candidate is discarded and must not replace
+	// the active generation.
+	ErrStaleGeneration = errors.New("embeddings: rebuild generation is stale, candidate index discarded")
 )

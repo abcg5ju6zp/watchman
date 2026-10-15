@@ -2,6 +2,9 @@ package embeddings
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"sync"
 
@@ -55,16 +58,39 @@ type Service interface {
 	Shutdown()
 }
 
+// generation identifies one fixed roster of entities encoded with one fixed
+// model configuration. Queries and the active index always belong to exactly
+// one generation; a candidate built for any other generation can never be
+// searched or swapped in after a newer generation has started.
+type generation struct {
+	// rosterHash fingerprints the ordered (id, name) pairs of the roster.
+	rosterHash string
+
+	// modelKey fingerprints the provider configuration (model, dimension, ...).
+	modelKey string
+
+	// dimension is the single vector dimension valid for this generation.
+	dimension int
+}
+
 // service implements the Service interface.
 type service struct {
 	logger log.Logger
 	config Config
 
 	provider Provider
-	index    *vectorIndex
 	cache    Cache
 
-	mu sync.RWMutex
+	// dimension and modelKey are fixed for the lifetime of the service and
+	// validated on every cache hit, so vectors produced under a different
+	// configuration can never enter an index.
+	dimension int
+	modelKey  string
+
+	mu        sync.RWMutex // guards index, activeGen and buildSeq
+	index     *vectorIndex // exactly one active generation, swapped atomically
+	activeGen generation
+	buildSeq  uint64 // monotonic rebuild token; only the newest build may swap
 }
 
 // NewService creates a new embeddings service.
@@ -109,21 +135,45 @@ func NewService(logger log.Logger, config Config, database db.DB) (Service, erro
 		provider.Name(), provider.Dimension(), config.Cache.Type, config.Cache.Size, config.CrossScriptOnly)
 
 	return &service{
-		logger:   logger,
-		config:   config,
-		provider: provider,
-		index:    newVectorIndex(provider.Dimension()),
-		cache:    cache,
+		logger:    logger,
+		config:    config,
+		provider:  provider,
+		cache:     cache,
+		dimension: provider.Dimension(),
+		modelKey:  modelConfigKey(config.Provider),
+		index:     newVectorIndex(provider.Dimension()),
 	}, nil
+}
+
+// getCachedVector returns a vector only when the cache entry verifies against
+// the fixed model configuration, the requested content and the dimension.
+func (s *service) getCachedVector(ctx context.Context, text string) ([]float64, bool) {
+	entry, ok := s.cache.Get(ctx, text)
+	if !ok || !entryMatches(text, s.modelKey, s.dimension, entry) {
+		return nil, false
+	}
+	return entry.Vector, true
+}
+
+// putCachedVector persists a freshly encoded vector with the verifiable
+// identity of the current model configuration and content.
+func (s *service) putCachedVector(ctx context.Context, text string, embedding []float64) error {
+	return s.cache.Put(ctx, text, cacheEntry{
+		Vector:      cloneVector(embedding),
+		ModelKey:    s.modelKey,
+		Dimension:  s.dimension,
+		ContentHash: hashContent(text),
+	})
 }
 
 // Encode converts text to a normalized embedding vector.
 func (s *service) Encode(ctx context.Context, text string) ([]float64, error) {
-	_, span := telemetry.StartSpan(ctx, "embeddings-encode")
+	ctx, span := telemetry.StartSpan(ctx, "embeddings-encode")
 	defer span.End()
 
-	// Check cache first
-	if emb, ok := s.cache.Get(ctx, text); ok {
+	// Check cache first - every hit is verified against the current model
+	// configuration, content identity and dimension.
+	if emb, ok := s.getCachedVector(ctx, text); ok {
 		span.SetAttributes(attribute.Bool("cache_hit", true))
 		return emb, nil
 	}
@@ -140,13 +190,18 @@ func (s *service) Encode(ctx context.Context, text string) ([]float64, error) {
 	}
 
 	// Validate dimension
-	if len(embeddings[0]) != s.provider.Dimension() {
+	if len(embeddings[0]) != s.dimension {
 		return nil, fmt.Errorf("%w: got %d, expected %d",
-			ErrDimensionMismatch, len(embeddings[0]), s.provider.Dimension())
+			ErrDimensionMismatch, len(embeddings[0]), s.dimension)
 	}
 
-	// Cache the result
-	s.cache.Put(ctx, text, embeddings[0])
+	// Cache the result. A failed query-cache write does not break the
+	// request, but it is logged and recorded rather than swallowed; the
+	// vector was simply not durably confirmed.
+	if err := s.putCachedVector(ctx, text, embeddings[0]); err != nil {
+		span.RecordError(err)
+		s.logger.Error().Logf("embeddings: failed to cache encoded query: %v", err)
+	}
 
 	return embeddings[0], nil
 }
@@ -164,7 +219,7 @@ func (s *service) EncodeBatch(ctx context.Context, texts []string) ([][]float64,
 	uncachedTexts := make([]string, 0, len(texts))
 
 	for i, text := range texts {
-		if emb, ok := s.cache.Get(ctx, text); ok {
+		if emb, ok := s.getCachedVector(ctx, text); ok {
 			result[i] = emb
 		} else {
 			uncachedIndices = append(uncachedIndices, i)
@@ -183,18 +238,57 @@ func (s *service) EncodeBatch(ctx context.Context, texts []string) ([][]float64,
 		if err != nil {
 			return nil, err
 		}
+		if len(embeddings) != len(uncachedTexts) {
+			return nil, fmt.Errorf("%w: got %d embeddings for %d texts",
+				ErrInvalidResponse, len(embeddings), len(uncachedTexts))
+		}
 
-		// Fill in results and cache
+		// Validate and fill in results and cache
 		for i, idx := range uncachedIndices {
+			if len(embeddings[i]) != s.dimension {
+				return nil, fmt.Errorf("%w: text %q embedding got %d, expected %d",
+					ErrDimensionMismatch, uncachedTexts[i], len(embeddings[i]), s.dimension)
+			}
 			result[idx] = embeddings[i]
-			s.cache.Put(ctx, uncachedTexts[i], embeddings[i])
+			if err := s.putCachedVector(ctx, uncachedTexts[i], embeddings[i]); err != nil {
+				// Non-fatal for ad-hoc query encoding, but never silent.
+				span.RecordError(err)
+				s.logger.Error().Logf("embeddings: failed to cache encoded batch text: %v", err)
+			}
 		}
 	}
 
 	return result, nil
 }
 
+// rosterFingerprint fingerprints the exact ordered pairing of entity IDs and
+// names. Order matters and lengths are framed, so reordering, renaming or a
+// roster change produces a different generation.
+func rosterFingerprint(ids, names []string) string {
+	h := sha256.New()
+	var frame [8]byte
+	write := func(value string) {
+		binary.BigEndian.PutUint64(frame[:], uint64(len(value)))
+		h.Write(frame[:])
+		h.Write([]byte(value))
+	}
+	for i := range ids {
+		write(ids[i])
+		write(names[i])
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // BuildIndex creates a searchable index from entity names.
+//
+// The rebuild fixes the model, dimension and the exact ordered roster up
+// front and assembles a fully verified candidate index offline. Provider or
+// cache-write failures leave the active index untouched while confirmed
+// batches remain in the cache, so retrying BuildIndex (including after a
+// restart with a persistent cache) resumes the same rebuild. The candidate
+// replaces the active index in a single swap only after vector count,
+// dimensions and entity mapping all verify, and only if no newer rebuild has
+// started in the meantime.
 func (s *service) BuildIndex(ctx context.Context, names []string, ids []string) error {
 	// Apply timeout from config
 	var cancel context.CancelFunc
@@ -212,78 +306,128 @@ func (s *service) BuildIndex(ctx context.Context, names []string, ids []string) 
 		return fmt.Errorf("embeddings: names and ids must have same length")
 	}
 
-	s.logger.Info().Logf("embeddings: building index for %d entities", len(names))
+	// 1. Snapshot the roster and fix the model configuration for the whole
+	// rebuild. Caller mutations after this point cannot mix into the
+	// candidate, and every vector below must match this generation.
+	snapNames := append([]string(nil), names...)
+	snapIDs := append([]string(nil), ids...)
 
-	// Check cache for all names first
-	allEmbeddings := make([][]float64, len(names))
-	uncachedIndices := make([]int, 0)
-	uncachedNames := make([]string, 0)
+	dimension := s.dimension
+	gen := generation{
+		rosterHash: rosterFingerprint(snapIDs, snapNames),
+		modelKey:   s.modelKey,
+		dimension:  dimension,
+	}
+	span.SetAttributes(attribute.String("generation", gen.rosterHash))
 
-	for i, name := range names {
-		if emb, ok := s.cache.Get(ctx, name); ok {
-			allEmbeddings[i] = emb
-		} else {
-			uncachedIndices = append(uncachedIndices, i)
-			uncachedNames = append(uncachedNames, name)
+	// Claim a rebuild token. A build that is no longer the newest by the
+	// time its candidate is ready must discard it.
+	s.mu.Lock()
+	s.buildSeq++
+	myBuildSeq := s.buildSeq
+	s.mu.Unlock()
+
+	s.logger.Info().Logf("embeddings: building index for %d entities (generation %s)", len(snapNames), gen.rosterHash)
+
+	// 2. Assemble candidate vectors positionally, resuming from confirmed
+	// cache entries. Hits are validated for model, content and dimension;
+	// anything else is (re)encoded.
+	vectors := make([][]float64, len(snapNames))
+	missingIndices := make([]int, 0, len(snapNames))
+	missingNames := make([]string, 0, len(snapNames))
+
+	for i, name := range snapNames {
+		if emb, ok := s.getCachedVector(ctx, name); ok {
+			vectors[i] = emb
+			continue
 		}
+		missingIndices = append(missingIndices, i)
+		missingNames = append(missingNames, name)
 	}
 
-	cacheHits := len(names) - len(uncachedNames)
+	cacheHits := len(snapNames) - len(missingNames)
 	span.SetAttributes(
 		attribute.Int("cache_hits", cacheHits),
-		attribute.Int("cache_misses", len(uncachedNames)),
+		attribute.Int("cache_misses", len(missingNames)),
 	)
 
 	if cacheHits > 0 {
-		s.logger.Info().Logf("embeddings: cache hits: %d/%d (%.1f%%)",
-			cacheHits, len(names), float64(cacheHits)/float64(len(names))*100)
+		s.logger.Info().Logf("embeddings: cache hits: %d/%d (%.1f%%), resuming confirmed progress",
+			cacheHits, len(snapNames), float64(cacheHits)/float64(len(snapNames))*100)
 	}
 
-	// Encode uncached names in batches
-	if len(uncachedNames) > 0 {
-		batchSize := s.config.BatchSize
+	// 3. Encode missing names in fixed roster order. A batch is confirmed
+	// only after every vector passes validation and its cache write
+	// succeeds; on failure the active index is untouched and the vectors
+	// are not counted as completed progress.
+	batchSize := s.config.BatchSize
+	for i := 0; i < len(missingNames); i += batchSize {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("embeddings: build index cancelled: %w", ctx.Err())
+		default:
+		}
 
-		for i := 0; i < len(uncachedNames); i += batchSize {
-			// Check for context cancellation
-			select {
-			case <-ctx.Done():
-				return fmt.Errorf("embeddings: build index cancelled: %w", ctx.Err())
-			default:
-			}
+		end := i + batchSize
+		if end > len(missingNames) {
+			end = len(missingNames)
+		}
 
-			end := i + batchSize
-			if end > len(uncachedNames) {
-				end = len(uncachedNames)
+		batch := missingNames[i:end]
+		batchEmbeddings, err := s.provider.Embed(ctx, batch)
+		if err != nil {
+			return fmt.Errorf("embeddings: failed to encode batch %d: %w", i/batchSize, err)
+		}
+		if len(batchEmbeddings) != len(batch) {
+			return fmt.Errorf("%w: got %d embeddings for %d texts in batch %d",
+				ErrInvalidResponse, len(batchEmbeddings), len(batch), i/batchSize)
+		}
+		for j, emb := range batchEmbeddings {
+			if len(emb) != dimension {
+				return fmt.Errorf("%w: %q got %d, expected %d in batch %d",
+					ErrDimensionMismatch, batch[j], len(emb), dimension, i/batchSize)
 			}
+		}
 
-			batch := uncachedNames[i:end]
-			embeddings, err := s.provider.Embed(ctx, batch)
-			if err != nil {
-				return fmt.Errorf("embeddings: failed to encode batch %d: %w", i/batchSize, err)
+		// Persist before counting the batch as confirmed progress.
+		for j, emb := range batchEmbeddings {
+			name := batch[j]
+			if err := s.putCachedVector(ctx, name, emb); err != nil {
+				return fmt.Errorf("%w: batch %d entity at position %d: %w",
+					ErrCacheWrite, i/batchSize, missingIndices[i+j], err)
 			}
+			vectors[missingIndices[i+j]] = emb
+		}
 
-			// Fill in results and cache
-			for j, emb := range embeddings {
-				originalIdx := uncachedIndices[i+j]
-				allEmbeddings[originalIdx] = emb
-				s.cache.Put(ctx, uncachedNames[i+j], emb)
-			}
-
-			// Log progress for large indexes
-			if len(uncachedNames) > 1000 && (i+batchSize)%(batchSize*10) == 0 {
-				s.logger.Info().Logf("embeddings: encoded %d/%d uncached entities", i+batchSize, len(uncachedNames))
-			}
+		if len(missingNames) > 1000 && (i+batchSize)%(batchSize*10) == 0 {
+			s.logger.Info().Logf("embeddings: encoded %d/%d uncached entities", i+batchSize, len(missingNames))
 		}
 	}
 
-	// Build the index
+	// 4. Build and verify the complete candidate while the active index
+	// keeps serving the previous generation. The candidate is never
+	// reachable through Search or IndexSize until the swap below.
+	candidate, err := newVectorIndexFromVectors(dimension, vectors, snapIDs, snapNames)
+	if err != nil {
+		return err
+	}
+
+	// 5. Swap only if this is still the newest rebuild. A rebuild for an
+	// older roster or configuration that finishes later is discarded
+	// instead of overwriting the newer active generation.
 	s.mu.Lock()
-	s.index = newVectorIndex(s.provider.Dimension())
-	s.index.Add(allEmbeddings, ids, names)
+	if myBuildSeq != s.buildSeq {
+		s.mu.Unlock()
+		span.SetAttributes(attribute.Bool("stale_generation", true))
+		return fmt.Errorf("%w: completed generation %s after generation %d started",
+			ErrStaleGeneration, gen.rosterHash, s.buildSeq)
+	}
+	s.index = candidate
+	s.activeGen = gen
 	s.mu.Unlock()
 
-	s.logger.Info().Logf("embeddings: index built with %d entities (%d from cache, %d newly encoded)",
-		len(names), cacheHits, len(uncachedNames))
+	s.logger.Info().Logf("embeddings: index built with %d entities generation %s (%d from cache, %d newly encoded)",
+		len(snapNames), gen.rosterHash, cacheHits, len(missingNames))
 
 	return nil
 }
@@ -302,16 +446,27 @@ func (s *service) Search(ctx context.Context, query string, k int) ([]SearchResu
 		return nil, fmt.Errorf("embeddings: failed to encode query: %w", err)
 	}
 
-	// Now acquire lock for index search
+	// Capture the single active generation under the lock. Only this index
+	// is ever searched; candidates in flight or discarded generations are
+	// not reachable.
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	idx := s.index
+	activeGen := s.activeGen
+	s.mu.RUnlock()
 
-	if s.index.Size() == 0 {
+	if idx.Size() == 0 {
 		return nil, ErrIndexNotBuilt
 	}
 
+	// A query encoded under a different model generation can never be
+	// scored against this index.
+	if len(queryEmb) != activeGen.dimension {
+		return nil, fmt.Errorf("%w: query dimension %d, active index dimension %d",
+			ErrDimensionMismatch, len(queryEmb), activeGen.dimension)
+	}
+
 	// Search index
-	results, err := s.index.Search(queryEmb, k)
+	results, err := idx.Search(queryEmb, k)
 	if err != nil {
 		return nil, err
 	}
